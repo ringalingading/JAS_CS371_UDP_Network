@@ -41,7 +41,7 @@ Was also used to understand epoll and socket relationships and troubleshoot erro
 // #include <time.h>
 
 #define MAX_EVENTS 64
-#define PACKET_SIZE 32
+#define MESSAGE_SIZE 16
 #define DEFAULT_CLIENT_THREADS 4
 #define MAX_PKT 4
 
@@ -73,7 +73,7 @@ typedef struct
 typedef unsigned int seq_nr; /*sequence numbers*/
 typedef struct
 {
-    unsigned char data[MAX_PKT * 4];
+    unsigned char data[MAX_PKT*4];
 } packet;
 typedef enum
 {
@@ -83,11 +83,9 @@ typedef enum
 
 typedef struct
 {
-
     frame_kind kind;
     seq_nr seq; /*What kind of frame*/
     packet info;
-
 } frame;
 
 /*
@@ -109,7 +107,7 @@ void *client_thread_func(void *arg)
     // char send_buf[MESSAGE_SIZE] = "ABCDEFGHIJKMLNOP"; /* Send 16-Bytes message every time */
     // define frame to send
     frame send_frame;
-
+    
     send_frame.kind = (frame_kind)ack;
     packet p;
     // p.data = "ABCDEFGHIJKMLNOP";
@@ -132,9 +130,8 @@ void *client_thread_func(void *arg)
      * It sends messages to the server, waits for a response using epoll,
      * and measures the round-trip time (RTT) of this request-response.
      */
-    // ensure only one event at a time received
 
-    event.events = EPOLLIN;
+    event.events = EPOLLOUT | EPOLLIN;
     event.data.fd = data->socket_fd;
     if (epoll_ctl(data->epoll_fd, EPOLL_CTL_ADD, data->socket_fd, &event) == -1)
     {
@@ -146,69 +143,70 @@ void *client_thread_func(void *arg)
 
     // ERROR: Doesn't like for loops?
     // printf("I run before the for loop!\n");
-    int counter2 = 0;
     while (num_requests)
     { // Distribute requests across threads
-        // printf("I run at the beginning of the for loop!\n");
+        //printf("I run at the beginning of the for loop!\n");
         pthread_mutex_lock(&request_mutex); // Lock before checking/modifying
         if (num_requests == 0)
         {
             pthread_mutex_unlock(&request_mutex);
             break; // Exit when all requests are processed
         }
-        num_requests--;                // Safe decrement
-        send_frame.seq = num_requests; // update sequence
+        num_requests--; // Safe decrement
         // printf("Currently %i messages left\n", num_requests); //debug
         pthread_mutex_unlock(&request_mutex); // Unlock after modification
-
-        // send until acknowledged
-        char acknowledged = 0;
-        int counter = 0;
-        counter2++;
-        while (!acknowledged)
+        // update sequence
+        send_frame.seq = num_requests;
+        // Wait for socket to be writable
+        int num_events = epoll_wait(data->epoll_fd, events, 1, -1);
+        if (num_events > 0)
         {
-            // debug
-            
-            if (counter)
+            // send until acknowledged
+            char acknowledged = 0;
+            int counter = 0;
+            while (!acknowledged)
             {
-                printf("current count! %d \n", counter);
-            }
-            counter++;
-            
-
-            socklen_t addrlen = sizeof(data->client_addr);
-            //printf("Sending frame %i\n", send_frame.seq);
-            // SEND FRAME
-            sendto(data->socket_fd, &send_frame, PACKET_SIZE, 0, (struct sockaddr *)&data->server_addr, addrlen);
-            data->total_messages++;
-            data->total_messages_sent++;
-
-            // Wait for response
-            int num_events = epoll_wait(data->epoll_fd, events, 1, 1);
-            if (num_events > 0)
-            {
-
-                int bytes_received = recvfrom(data->socket_fd, &recv_frame, PACKET_SIZE, 0, (struct sockaddr *)&data->client_addr, &addrlen);
-                // usleep(10000); // 10ms delay
-
-                // received packet
-                // debug
-                // printf("%i\n", send_frame.seq);
-                // printf("%i\n", recv_frame.seq);
-                
-                if (bytes_received > 0 && recv_frame.seq == send_frame.seq)
-                {
-                    recv_frame.info.data[bytes_received] = '\0';
-                    //printf("Received packet %i server: %s\n", recv_frame.seq, recv_frame.info.data);
-                    data->total_messages++;
-                    data->total_messages_recv++;
-                    // continue to next packet
-                    acknowledged = 1;
+                //printf("I want acknowledgement!\n");
+                if(counter) {
+                    printf("current count! %i\n",counter);
                 }
+                counter++;
+                
+                socklen_t addrlen = sizeof(data->client_addr);
+                printf("Sending frame %i\n", send_frame.seq);
+                sendto(data->socket_fd, &send_frame, MESSAGE_SIZE, 0, (struct sockaddr *)&data->server_addr, addrlen);
+                data->total_messages++;
+                data->total_messages_sent++;
+
+                // Wait for response
+                // num_events = epoll_wait(data->epoll_fd, events, 1, -1);
+                
+                for (int i = 0; i < 10;)
+                {
                     
+                    socklen_t addrlen = sizeof(data->client_addr);
+                    int bytes_received = recvfrom(data->socket_fd, &recv_frame, MESSAGE_SIZE, 0, (struct sockaddr *)&data->client_addr, &addrlen);
+                    // usleep(10000); // 10ms delay
+                    
+                    //received packet
+                    if (bytes_received > 0)
+                    {
+                        recv_frame.info.data[bytes_received] = '\0';
+                        printf("Received packet %i server: %s\n",recv_frame.seq, recv_frame.info.data);
+                        data->total_messages++;
+                        data->total_messages_recv++;
+                        //continue to next packet
+                        acknowledged = 1;
+                        break;
+                    }
+                    //wait for ack to come back
+                    //total of 100 microseconds
+                    usleep(10);
+                }
             }
         }
     }
+    // printf("I run after the for loop!\n");
 
     /* TODO:
      * The function exits after sending and receiving a predefined number of messages (num_requests).
@@ -290,7 +288,6 @@ void run_client()
             perror("epoll_create");
             exit(EXIT_FAILURE);
         }
-
         thread_data[i].epoll_fd = epoll_fd;
         thread_data[i].socket_fd = socket_fd;
         thread_data[i].server_addr = server_addr;
@@ -305,12 +302,12 @@ void run_client()
      */
 
     // Wait for threads to complete
-
+    
     for (int i = 0; i < num_client_threads; i++)
     {
         pthread_join(threads[i], NULL);
     }
-    // printf("I made it!\n");
+    printf("I made it!\n");
 
     long long total_rtt = 0; /* Accumulated Round-Trip Time (RTT) for all messages sent and received (in microseconds). */
     for (int i = 0; i < num_client_threads; i++)
@@ -390,17 +387,13 @@ void run_server()
     }
 
     // Add the server socket to epoll
-    event.events = EPOLLIN;
+    event.events = EPOLLIN | EPOLLET;
     event.data.fd = server_fd;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) == -1)
     {
         perror("epoll_ctl");
         exit(EXIT_FAILURE);
     }
-
-    //simulate small buffer
-    int buffer_size = 512;  // Set a small buffer size, e.g., 512 bytes
-    setsockopt(server_fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
 
     /* Server's run-to-completion event loop */
     while (1)
@@ -418,13 +411,12 @@ void run_server()
             if (events[i].events)
             {
                 //printf("I'm in!\n");
-                //  Read from the client socket
+                // Read from the client socket
                 socklen_t addrlen = sizeof(client_addr);
-                int bytes_read = recvfrom(events[i].data.fd, &recv_packet, PACKET_SIZE, 0, (struct sockaddr *)&client_addr, &addrlen);
+                int bytes_read = recvfrom(events[i].data.fd, &recv_packet, MESSAGE_SIZE, 0, (struct sockaddr *)&client_addr, &addrlen);
 
                 if (bytes_read <= 0)
                 {
-                    printf("I quit!!\n");
                     // If client disconnects or error occurs, remove the socket from epoll
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd, NULL);
                     close(events[i].data.fd);
@@ -434,10 +426,10 @@ void run_server()
                     // Respond to client
                     recv_packet.info.data[bytes_read] = '\0';
                     printf("Received SN %i: %s\n", recv_packet.seq, recv_packet.info.data);
-
-                    // update type of packet
-                    recv_packet.kind = ack;
-                    sendto(events[i].data.fd, &recv_packet, PACKET_SIZE, 0, (struct sockaddr *)&client_addr, addrlen);
+                    
+                    //update type of packet
+                    recv_packet.kind=ack;
+                    sendto(events[i].data.fd, &recv_packet, MESSAGE_SIZE, 0, (struct sockaddr *)&client_addr, addrlen);
                     // for TCP
                     // write(events[i].data.fd, buffer, MESSAGE_SIZE); // Send a response
                 }
